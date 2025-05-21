@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template to create IAM users, groups, Secrets Manager secret,
+  Parameter Store parameters, EventBridge rule, and Lambda function for user creation logging.
+
+Parameters:
+  UserEmailS3:
+    Type: String
+    Description: Email address for the s3-user.
+    Default: s3.user@example.com
+    AllowedPattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: Must be a valid email address.
+  UserEmailEC2:
+    Type: String
+    Description: Email address for the ec2-user.
+    Default: ec2.user@example.com
+    AllowedPattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: Must be a valid email address.
+
+Resources:
+  # 1. One-Time Password: Auto-generated and stored in Secrets Manager
+  # This secret will store a randomly generated temporary password for the IAM users.
+  IAMUserTempPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Temporary password for new IAM users created by CloudFormation.
+      GenerateSecretString:
+        PasswordLength: 16 # Specifies the length of the generated password.
+        ExcludeCharacters: '"@/\' ' # Excludes characters that might cause issues in console login or parsing.
+        IncludeSpace: false # Ensures no spaces are included in the password.
+        RequireEachIncludedType: true # Requires at least one uppercase, lowercase, number, and symbol.
+        ExcludePunctuation: false # Allows punctuation for stronger password complexity.
+        ExcludeUppercase: false # Ensures uppercase letters are included.
+        ExcludeLowercase: false # Ensures lowercase letters are included.
+        ExcludeNumbers: false # Ensures numbers are included.
+
+  # 2. S3 User Group with read access to S3
+  # This IAM group will have read-only access to Amazon S3.
+  S3ReadOnlyGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: S3ReadOnlyGroupCFN # A descriptive name for the group.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess # Attaches the AWS managed policy for S3 read-only access.
+
+  # 3. EC2 Group with read access to EC2
+  # This IAM group will have read-only access to Amazon EC2.
+  EC2ReadOnlyGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: EC2ReadOnlyGroupCFN # A descriptive name for the group.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess # Attaches the AWS managed policy for EC2 read-only access.
+
+  # 4. Two IAM users with console access
+  # ec2-user assigned to EC2 Group
+  EC2User:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: ec2-user-cfn # Unique username for the EC2 user.
+      Groups:
+        - !Ref EC2ReadOnlyGroup # Assigns the user to the EC2 read-only group.
+      LoginProfile:
+        Password: !GetAtt IAMUserTempPassword.SecretString # Sets the temporary password from Secrets Manager.
+        PasswordResetRequired: true # Forces the user to change password on first login.
+
+  # s3-user assigned to S3 Group
+  S3User:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: s3-user-cfn # Unique username for the S3 user.
+      Groups:
+        - !Ref S3ReadOnlyGroup # Assigns the user to the S3 read-only group.
+      LoginProfile:
+        Password: !GetAtt IAMUserTempPassword.SecretString # Sets the temporary password from Secrets Manager.
+        PasswordResetRequired: true # Forces the user to change password on first login.
+
+  # User email attribute stored in Parameter Store
+  # Stores the S3 user's email in AWS Systems Manager Parameter Store.
+  S3UserEmailParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /IAMUsers/s3-user-cfn/email # Path and name for the parameter.
+      Description: Email for s3-user-cfn # Description of the parameter.
+      Type: String # Data type of the parameter.
+      Value: !Ref UserEmailS3 # Value comes from the CloudFormation parameter.
+
+  # Stores the EC2 user's email in AWS Systems Manager Parameter Store.
+  EC2UserEmailParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /IAMUsers/ec2-user-cfn/email # Path and name for the parameter.
+      Description: Email for ec2-user-cfn # Description of the parameter.
+      Type: String # Data type of the parameter.
+      Value: !Ref UserEmailEC2 # Value comes from the CloudFormation parameter.
+
+  # 5. EventBridge Rule to detect new user creation, triggering a Lambda function
+  # Lambda Function Role: Defines the IAM role that the Lambda function will assume.
+  UserCreationLoggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com # Allows Lambda service to assume this role.
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        # Provides basic permissions for Lambda to write logs to CloudWatch.
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        # Custom policy to allow the Lambda function to retrieve the secret and parameters.
+        - PolicyName: SecretsManagerAndParameterStoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue # Permission to read the secret value.
+                Resource: !Ref IAMUserTempPassword # Specifies the ARN of the secret.
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter # Permission to read parameter values.
+                Resource:
+                  # Specifies the ARNs of the email parameters.
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/IAMUsers/s3-user-cfn/email
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/IAMUsers/ec2-user-cfn/email
+
+  # Lambda Function: The Python function that will be invoked by EventBridge.
+  UserCreationLoggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UserCreationLoggerCFN # A descriptive name for the Lambda function.
+      Handler: index.handler # Specifies the function entry point (file.function_name).
+      Runtime: python3.9 # Specifies the Python runtime version.
+      Role: !GetAtt UserCreationLoggerLambdaRole.Arn # Assigns the IAM role to the Lambda function.
+      Timeout: 30 # Sets the maximum execution time for the function in seconds.
+      Code:
+        ZipFile: | # Inline Python code for the Lambda function.
+          import json
+          import os
+          import boto3
+
+          def handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+
+              # Extract username from the EventBridge event.
+              # For 'CreateUser' events, the username is typically found in 'detail.requestParameters.userName'.
+              try:
+                  user_name = event['detail']['requestParameters']['userName']
+                  print(f"Detected new user creation for: {user_name}")
+
+                  secrets_client = boto3.client('secretsmanager')
+                  ssm_client = boto3.client('ssm')
+
+                  # Retrieve temporary password from Secrets Manager.
+                  # The secret name is passed as an environment variable to the Lambda.
+                  secret_name = os.environ.get('SECRET_NAME', '')
+                  if not secret_name:
+                      print("SECRET_NAME environment variable not set.")
+                      return { 'statusCode': 500, 'body': 'SECRET_NAME not set' }
+
+                  try:
+                      get_secret_value_response = secrets_client.get_secret_value(
+                          SecretId=secret_name
+                      )
+                      if 'SecretString' in get_secret_value_response:
+                          temp_password = get_secret_value_response['SecretString']
+                      else:
+                          # Fallback for binary secrets, though we expect a string.
+                          temp_password = "Password not found (binary secret)"
+                      print(f"Successfully retrieved temporary password for {user_name}.")
+                  except Exception as e:
+                      print(f"Error retrieving secret '{secret_name}': {e}")
+                      temp_password = "Error retrieving password"
+
+                  # Retrieve user email from Parameter Store.
+                  # The parameter name is constructed based on the username.
+                  email_param_name = f"/IAMUsers/{user_name}/email"
+                  try:
+                      get_parameter_response = ssm_client.get_parameter(
+                          Name=email_param_name,
+                          WithDecryption=False # Email is not encrypted.
+                      )
+                      user_email = get_parameter_response['Parameter']['Value']
+                      print(f"Successfully retrieved email for {user_name}.")
+                  except Exception as e:
+                      print(f"Error retrieving parameter '{email_param_name}': {e}")
+                      user_email = "Error retrieving email"
+
+
+                  # Log the email and temporary password to CloudWatch Logs.
+                  # WARNING: In a production environment, avoid logging sensitive information directly.
+                  # This is for demonstration purposes as requested by the lab.
+                  print(f"User Email: {user_email}")
+                  print(f"Temporary Password: {temp_password}")
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'User creation logged successfully',
+                          'userName': user_name,
+                          'userEmail': user_email,
+                          'tempPasswordLogged': 'true' # Confirms password was logged for demo.
+                      })
+                  }
+
+              except KeyError as e:
+                  print(f"KeyError: Missing expected key in event: {e}")
+                  print("This Lambda expects an IAM CreateUser event from CloudTrail via EventBridge.")
+                  return { 'statusCode': 400, 'body': f'Invalid event structure: {e}' }
+              except Exception as e:
+                  print(f"An unexpected error occurred: {e}")
+                  return { 'statusCode': 500, 'body': f'Internal Server Error: {e}' }
+      Environment:
+        Variables:
+          SECRET_NAME: !Ref IAMUserTempPassword # Passes the ARN of the secret to the Lambda as an environment variable.
+
+  # EventBridge Rule: Defines the rule that triggers the Lambda function.
+  IAMUserCreationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: IAMUserCreationRuleCFN # A descriptive name for the EventBridge rule.
+      Description: Detects IAM user creation events from CloudTrail.
+      EventPattern: # Defines the pattern that the event must match.
+        source:
+          - aws.iam # Specifies that the event source is AWS IAM.
+        detail-type:
+          - AWS API Call via CloudTrail # Specifies that it's an API call logged by CloudTrail.
+        detail:
+          eventName:
+            - CreateUser # Specifically targets the 'CreateUser' API call.
+      Targets:
+        - Arn: !GetAtt UserCreationLoggerLambda.Arn # The ARN of the Lambda function to invoke.
+          Id: UserCreationLoggerTarget # A unique identifier for the target.
+
+  # Lambda Permission for EventBridge to invoke it: Grants EventBridge permission to call the Lambda function.
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt UserCreationLoggerLambda.Arn # The ARN of the Lambda function.
+      Action: lambda:InvokeFunction # The action allowed (invoking the function).
+      Principal: events.amazonaws.com # The service principal that is allowed to invoke (EventBridge).
+      SourceArn: !GetAtt IAMUserCreationEventRule.Arn # The ARN of the EventBridge rule that will invoke the function.
+
+Outputs:
+  S3ReadOnlyGroupName:
+    Description: Name of the S3 Read-Only IAM Group
+    Value: !Ref S3ReadOnlyGroup
+  EC2ReadOnlyGroupName:
+    Description: Name of the EC2 Read-Only IAM Group
+    Value: !Ref EC2ReadOnlyGroup
+  EC2UserName:
+    Description: Name of the EC2 IAM User
+    Value: !Ref EC2User
+  S3UserName:
+    Description: Name of the S3 IAM User
+    Value: !Ref S3User
+  IAMUserTempPasswordSecretARN:
+    Description: ARN of the Secrets Manager secret storing the temporary password
+    Value: !Ref IAMUserTempPassword
+  UserCreationLoggerLambdaARN:
+    Description: ARN of the Lambda function that logs user creation
+    Value: !GetAtt UserCreationLoggerLambda.Arn
+  IAMUserCreationEventRuleARN:
+    Description: ARN of the EventBridge Rule for IAM user creation
+    Value: !GetAtt IAMUserCreationEventRule.Arn
+  S3UserEmailParameterName:
+    Description: Name of the Parameter Store parameter for S3 user email
+    Value: !Ref S3UserEmailParameter
+  EC2UserEmailParameterName:
+    Description: Name of the Parameter Store parameter for EC2 user email
+    Value: !Ref EC2UserEmailParameter
