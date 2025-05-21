@@ -1,4 +1,4 @@
-AWSTemplateFormatVersion: '2010-09-09'
+AWSTemplateFormatVersion: '2025-05-21'
 Description: 'CloudFormation template to create IAM users, groups, and related resources'
 
 Parameters:
